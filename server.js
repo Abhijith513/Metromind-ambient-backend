@@ -18,13 +18,8 @@ const app = express();
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet());
 
-// ── CORS – restrict to your frontend origin in production ────────────────────
-app.use(
-  cors({
-    origin: process.env.FRONTEND_ORIGIN ?? "http://localhost:5173",
-    methods: ["POST"],
-  })
-);
+// ── CORS – Allow Vercel frontend to connect ────────────────────
+app.use(cors({ origin: "*" }));
 
 // ── Transcription route ───────────────────────────────────────────────────────
 // Note: do NOT add express.json() / urlencoded before this route –
