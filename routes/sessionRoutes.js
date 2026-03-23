@@ -1,4 +1,3 @@
-// routes/sessionRoutes.js
 import express from "express";
 import multer from "multer";
 import path from "path";
@@ -20,7 +19,6 @@ import {
 const router = express.Router();
 
 const UPLOAD_DIR = path.resolve("uploads/sessions");
-
 await fs.mkdir(UPLOAD_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
@@ -37,7 +35,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 25 * 1024 * 1024, // per segment, not whole session
+    fileSize: 25 * 1024 * 1024,
   },
 });
 
@@ -62,13 +60,33 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     return res.status(400).json({ error: "No audio segment received." });
   }
 
+  const rawSegmentIndex = req.body?.segmentIndex;
+  const segmentIndex =
+    rawSegmentIndex !== undefined && rawSegmentIndex !== null && rawSegmentIndex !== ""
+      ? Number(rawSegmentIndex)
+      : session.segmentCount;
+
+  if (!Number.isFinite(segmentIndex)) {
+    if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
+    return res.status(400).json({ error: "Invalid segmentIndex." });
+  }
+
   try {
     setSessionStatus(sessionId, "processing_segments");
 
+    console.log(
+      `[Segment upload] session=${sessionId} index=${segmentIndex} mime=${req.file.mimetype} size=${req.file.size}`
+    );
+
     const transcript = await transcribeSegment(req.file.path, req.file.mimetype);
 
+    console.log(
+      `[Segment transcript] session=${sessionId} index=${segmentIndex} chars=${transcript?.length ?? 0}`
+    );
+    console.log(transcript || "[EMPTY TRANSCRIPT]");
+
     appendTranscriptPart(sessionId, {
-      index: session.segmentCount,
+      index: segmentIndex,
       transcript,
       receivedAt: new Date().toISOString(),
     });
@@ -76,9 +94,12 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     return res.status(202).json({
       ok: true,
       status: "recording",
-      segmentIndex: session.segmentCount,
+      segmentIndex,
+      transcriptLength: transcript?.length ?? 0,
     });
   } catch (err) {
+    console.error(`[Segment failure] session=${sessionId} index=${segmentIndex}`, err);
+
     addSessionError(sessionId, {
       stage: "segment_transcription",
       message: err instanceof Error ? err.message : "Unknown error",
@@ -93,6 +114,7 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
 
 router.get("/sessions/:sessionId/status", (req, res) => {
   const session = getSession(req.params.sessionId);
+
   if (!session) {
     return res.status(404).json({ error: "Session not found." });
   }
@@ -121,12 +143,26 @@ router.post("/sessions/:sessionId/finalize", async (req, res) => {
   try {
     setSessionStatus(sessionId, "finalizing");
 
-    const fullTranscript = session.transcriptParts
-      .sort((a, b) => a.index - b.index)
+    const orderedParts = session.transcriptParts
+      .slice()
+      .sort((a, b) => a.index - b.index);
+
+    const fullTranscript = orderedParts
       .map((p) => p.transcript)
+      .filter(Boolean)
       .join("\n");
 
+    console.log(
+      `[Finalize] session=${sessionId} parts=${orderedParts.length} fullTranscriptChars=${fullTranscript.length}`
+    );
+    console.log("[FULL TRANSCRIPT START]");
+    console.log(fullTranscript || "[EMPTY FULL TRANSCRIPT]");
+    console.log("[FULL TRANSCRIPT END]");
+
     const finalNote = await generateSoapFromTranscript(fullTranscript);
+
+    console.log("[FINAL SOAP NOTE]");
+    console.log(JSON.stringify(finalNote, null, 2));
 
     setFinalNote(sessionId, finalNote);
 
@@ -135,6 +171,8 @@ router.post("/sessions/:sessionId/finalize", async (req, res) => {
       status: "completed",
     });
   } catch (err) {
+    console.error(`[Finalize failure] session=${sessionId}`, err);
+
     addSessionError(sessionId, {
       stage: "final_note_generation",
       message: err instanceof Error ? err.message : "Unknown error",
