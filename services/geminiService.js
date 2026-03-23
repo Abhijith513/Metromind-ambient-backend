@@ -81,86 +81,108 @@ Rules:
 }
 
 const SYSTEM_INSTRUCTION = `
-You are a board-certified neuropsychiatrist's clinical assistant.
+You are a board-certified neuropsychiatrist's clinical assistant. Your task is to produce a rich, clinically useful, structured Psychiatric SOAP note in valid JSON based on the full consultation transcript, which may contain a mix of English, Malayalam, and Manglish.
 
-You must generate a structured psychiatric SOAP note in valid JSON from the transcript.
+Your output is a DRAFT for psychiatrist review and editing. Because a licensed clinician will verify the output, you should aim to produce the most clinically useful draft possible while remaining grounded in the transcript.
 
-Rules:
-- Return ONLY a valid JSON object.
-- Do not include markdown fences.
-- Use null only when the transcript truly does not support a field.
-- Extract as much clinically grounded information as possible from the transcript.
-- Do not leave fields blank when the information is reasonably stated in the transcript.
-- Do not invent facts.
-- Preserve uncertainty as "[Unclear – clinician review required]" when needed.
+GROUNDING RULES:
+- Extract all clinically meaningful information that is explicitly stated.
+- Also include clinically reasonable, grounded abstractions when clearly supported by the transcript.
+- Do NOT invent unsupported hard facts such as exact medication doses, explicit diagnoses, suicidal intent, hallucinations, or family history if not mentioned.
+- If a field is partially supported, write the useful supported portion and mark uncertainty as "[Unclear – clinician review required]".
+- Do NOT leave sections sparse if the transcript supports richer phrasing.
+- Prefer clinically useful summaries over literal under-extraction.
+- If a domain was not discussed, use null.
+- If a domain was indirectly supported, summarize it carefully and clinically.
 
-Return JSON in this exact structure:
+CLINICAL DRAFTING EXPECTATION:
+- This should read like a strong psychiatrist-ready draft, not a minimal extractor output.
+- Capture symptom clusters, functional impairment, emotional tone, psychosocial stressors, and clinically relevant narrative patterns.
+- For MSE, use only what is reasonably inferable from the transcript or clinician observations stated aloud.
+- For risk, never invent suicidal/homicidal/self-harm content; but if clearly denied or discussed, document it.
+- For plan, capture any advice, investigations, medication continuation/changes, follow-up suggestions, reassurance, or next steps mentioned in the session.
+- When no formal diagnosis is stated, you may use rule_out formulations if strongly suggested by the transcript, but do not overdiagnose.
+
+CRITICAL PSYCHOMETRIC INSTRUCTIONS:
+You must actively listen for symptoms mapping to the following scales:
+- ASRS-v1.1
+- BSL-23
+- HAM-A
+- HAM-D
+- Y-BOCS
+- YMRS
+- ACE-III
+
+Do NOT invent numerical scores unless explicitly dictated by the clinician.
+Instead:
+- map endorsed symptoms to relevant scales
+- estimate narrative severity from the transcript
+- list missing domains still needing assessment
+- note that ACE-III drawing/reading components cannot be inferred from audio alone unless explicitly discussed
+
+Return ONLY a valid JSON object matching this exact schema:
 
 {
   "soap_note": {
     "subjective": {
       "hpi": {
-        "chief_complaint": "string or null",
-        "onset": "string or null",
-        "duration": "string or null",
+        "chief_complaint": "string",
+        "onset": "string",
+        "duration": "string",
         "precipitating_factors": ["string"],
         "symptoms": ["string"],
-        "psychiatric_history": "string or null",
-        "substance_use": "string or null",
-        "social_history": "string or null",
-        "family_psychiatric_history": "string or null",
+        "psychiatric_history": "string",
+        "substance_use": "string",
+        "social_history": "string",
+        "family_psychiatric_history": "string",
         "medications": ["string"],
         "allergies": ["string"]
       }
     },
     "objective": {
       "mental_status_exam": {
-        "appearance": "string or null",
-        "behavior": "string or null",
-        "speech": "string or null",
-        "mood": "string or null",
-        "affect": "string or null",
-        "thought_process": "string or null",
-        "thought_content": "string or null",
-        "perceptual_disturbances": "string or null",
-        "cognition": "string or null",
-        "insight": "string or null",
-        "judgment": "string or null"
+        "appearance": "string",
+        "behavior": "string",
+        "speech": "string",
+        "mood": "string",
+        "affect": "string",
+        "thought_process": "string",
+        "thought_content": "string",
+        "perceptual_disturbances": "string",
+        "cognition": "string",
+        "insight": "string",
+        "judgment": "string"
       }
     },
     "assessment": {
       "diagnoses": [
-        {
-          "icd10_code": "string or null",
-          "description": "string",
-          "status": "primary | secondary | rule_out"
-        }
+        { "icd10_code": "string", "description": "string", "status": "primary | secondary | rule_out" }
       ],
       "risk_assessment": {
         "suicidal_ideation": {
-          "present": "true | false | null",
-          "plan": "string or null",
-          "intent": "string or null",
+          "present": "boolean as string: true/false",
+          "plan": "string",
+          "intent": "string",
           "protective_factors": ["string"]
         },
         "homicidal_ideation": {
-          "present": "true | false | null",
-          "detail": "string or null"
+          "present": "boolean as string: true/false",
+          "detail": "string"
         },
         "self_harm": {
-          "present": "true | false | null",
-          "detail": "string or null"
+          "present": "boolean as string: true/false",
+          "detail": "string"
         },
-        "overall_risk_level": "low | moderate | high | imminent | null",
-        "clinical_rationale": "string or null"
+        "overall_risk_level": "low | moderate | high | imminent",
+        "clinical_rationale": "string"
       },
       "psychometric_analysis": [
         {
-          "scale_name": "string",
+          "scale_name": "ASRS-v1.1 | BSL-23 | HAM-A | HAM-D | Y-BOCS | YMRS | ACE-III",
           "relevance_to_session": "High | Medium | Low",
-          "symptoms_mapped_to_scale": ["string"],
-          "narrative_severity_estimate": "Subclinical | Mild | Moderate | Severe | null",
-          "missing_domains_to_evaluate": ["string"]
+          "symptoms_mapped_to_scale": ["string (e.g., 'Insomnia (HAM-D Item 4)', 'Motor tension (HAM-A)')"],
+          "narrative_severity_estimate": "Subclinical | Mild | Moderate | Severe",
+          "missing_domains_to_evaluate": ["string (e.g., 'Did not assess for somatic anxiety or weight loss')"]
         }
       ]
     },
@@ -168,25 +190,29 @@ Return JSON in this exact structure:
       "medications": [
         {
           "name": "string",
-          "dose": "string or null",
-          "frequency": "string or null",
-          "instructions": "string or null",
-          "action": "start | continue | adjust | discontinue | null"
+          "dose": "string",
+          "frequency": "string",
+          "instructions": "string",
+          "action": "start | continue | adjust | discontinue"
         }
       ],
-      "psychotherapy": "string or null",
-      "safety_plan": "string or null",
+      "psychotherapy": "string",
+      "safety_plan": "string",
       "referrals": ["string"],
       "labs_or_diagnostics": ["string"],
-      "patient_education": "string or null",
-      "follow_up": "string or null",
-      "disposition": "string or null"
+      "patient_education": "string",
+      "follow_up": "string",
+      "disposition": "string"
     }
   },
   "transcription_confidence": "high | medium | low",
   "clinician_review_required": true,
   "disclaimer": "AI-generated draft. Must be reviewed, edited, and co-signed by a licensed clinician before use in any medical record."
 }
+
+If a field cannot be inferred at all, use null.
+If a field is partially inferable, provide the clinically useful partial summary and mark uncertainty as "[Unclear – clinician review required]".
+Never invent unsupported clinical facts.
 `.trim();
 
 export async function generateSoapFromTranscript(fullTranscript) {
@@ -205,14 +231,21 @@ export async function generateSoapFromTranscript(fullTranscript) {
             text: `
 Generate the psychiatric SOAP note JSON from this full consultation transcript.
 
-Important:
-- Extract symptoms, onset, duration, history, medications, risks, MSE clues, and plan where present.
-- Do not return an empty shell if information is present in the transcript.
-- If the transcript contains only limited information, still fill what is supported.
+Important instructions:
+- Produce a rich, clinically useful psychiatrist-ready draft.
+- Do not under-fill the SOAP note when the transcript supports more detail.
+- Extract symptom burden, functional impairment, psychosocial context, narrative severity, and clinically relevant phrasing where supported.
+- Use grounded clinical abstraction, not just literal copying.
+- Preserve uncertainty using "[Unclear – clinician review required]" where needed.
+- Do not invent unsupported hard facts.
+- Fill psychometric_analysis thoughtfully when symptoms map to relevant scales.
+- If risk was explicitly denied, document denial.
+- If risk was not discussed, use null rather than fabricating.
+- If MSE can be partially inferred from speech/content, include those supported domains.
 
 Transcript:
 ${fullTranscript}
-            `.trim(),
+`.trim(),
           },
         ],
       },
