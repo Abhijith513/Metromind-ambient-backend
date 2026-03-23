@@ -1,15 +1,9 @@
 /**
- * POST /api/transcribe
+ * POST /api/transcribe (Asynchronous)
+ * GET /api/job/:jobId
  *
- * Accepts a multipart audio upload, stages it via the Gemini File API,
- * generates a structured psychiatric SOAP note, then immediately deletes
- * the local file (HIPAA / DPDP compliance).
- *
- * Dependencies:
- *   npm install express multer @google/genai uuid
- *
- * Environment variables:
- *   GEMINI_API_KEY   – your Google AI Studio / Vertex key
+ * Accepts a multipart audio upload, returns a Job ID immediately, and 
+ * processes the audio with Gemini in the background. 
  */
 
 import express from "express";
@@ -19,17 +13,18 @@ import fs from "fs/promises";
 import { randomUUID } from "crypto";
 import { GoogleGenAI } from "@google/genai";
 
-// ─── Router ──────────────────────────────────────────────────────────────────
+// ─── Router & In-Memory Store ────────────────────────────────────────────────
 
 const router = express.Router();
+const jobs = new Map(); // Tracks background jobs
 
 // ─── Gemini client ────────────────────────────────────────────────────────────
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// ─── Multer – disk storage (we need a real path for uploadFile) ───────────────
+// ─── Multer – disk storage ────────────────────────────────────────────────────
 
-const UPLOAD_DIR = path.resolve("tmp_uploads"); // ephemeral, never committed
+const UPLOAD_DIR = path.resolve("tmp_uploads");
 
 const storage = multer.diskStorage({
   destination: async (_req, _file, cb) => {
@@ -37,7 +32,6 @@ const storage = multer.diskStorage({
     cb(null, UPLOAD_DIR);
   },
   filename: (_req, file, cb) => {
-    // Preserve original extension; randomise name to prevent collisions / path traversal
     const ext = path.extname(file.originalname).toLowerCase() || ".webm";
     cb(null, `${randomUUID()}${ext}`);
   },
@@ -54,7 +48,7 @@ const ALLOWED_MIME_TYPES = new Set([
   "audio/aac",
 ]);
 
-const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB (Gemini File API limit)
+const MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 
 const upload = multer({
   storage,
@@ -162,136 +156,60 @@ Never invent clinical information; flag uncertainty with "[Unclear – clinician
 
 async function waitForFileActive(fileResource, { maxWaitMs = 120_000, pollMs = 3_000 } = {}) {
   const deadline = Date.now() + maxWaitMs;
-
   while (Date.now() < deadline) {
     const refreshed = await ai.files.get({ name: fileResource.name });
     if (refreshed.state === "ACTIVE") return refreshed;
     if (refreshed.state === "FAILED") throw new Error(`Gemini file processing failed: ${refreshed.name}`);
     await new Promise((r) => setTimeout(r, pollMs));
   }
-
   throw new Error("Timed out waiting for Gemini file to become ACTIVE.");
 }
 
-// ─── Route handler ────────────────────────────────────────────────────────────
+// ─── NEW: The Background Worker ──────────────────────────────────────────────
 
-router.post(
-  "/transcribe",
-  upload.single("audio"), // field name must be "audio" in the multipart form
-  async (req, res) => {
-    const localPath = req.file?.path;
+async function processAudioInBackground(jobId, file) {
+  const localPath = file.path;
+  let uploadedFile;
 
-    // Wrap everything so we can guarantee local file deletion in all paths
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "No audio file received." });
-      }
+  try {
+    console.log(`[Job ${jobId}] Starting background processing...`);
 
-      // ── 1. Upload to Gemini File API ────────────────────────────────────────
-      let uploadedFile;
-      try {
-        uploadedFile = await ai.files.upload({
-          file: localPath,                      // path on disk
-          config: {
-            mimeType: req.file.mimetype,
-            displayName: `psych-session-${randomUUID()}`, // no PHI in display name
-          },
-        });
-      } catch (uploadErr) {
-        console.error("[Gemini] File upload error:", uploadErr);
-        return res.status(502).json({ error: "Failed to stage audio with Gemini File API." });
-      }
+    // 1. Upload to Gemini
+    uploadedFile = await ai.files.upload({
+      file: localPath,
+      config: {
+        mimeType: file.mimetype,
+        displayName: `psych-session-${jobId}`,
+      },
+    });
 
-      // ── 2. Poll until the file is ACTIVE (virus-scan + transcoding) ─────────
-      try {
-        uploadedFile = await waitForFileActive(uploadedFile);
-      } catch (pollErr) {
-        console.error("[Gemini] File activation error:", pollErr);
-        // Best-effort: try to delete the remote file even if it failed
-        await ai.files.delete({ name: uploadedFile.name }).catch(() => {});
-        return res.status(504).json({ error: "Audio processing timed out on Gemini side." });
-      }
+    // 2. Wait for it to be active
+    uploadedFile = await waitForFileActive(uploadedFile);
 
-      // ── 3. Generate the SOAP note ────────────────────────────────────────────
-      let geminiResponse;
-      try {
-        geminiResponse = await ai.models.generateContent({
-          model: "gemini-2.5-flash",           // swap to gemini-1.5-pro for higher accuracy
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            temperature: 0.1,                  // low temp for clinical determinism
-            responseMimeType: "application/json",
-          },
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  fileData: {
-                    fileUri: uploadedFile.uri,
-                    mimeType: req.file.mimetype,
-                  },
-                },
-                {
-                  text: "Generate the psychiatric SOAP note JSON for this session recording.",
-                },
-              ],
-            },
+    // 3. Generate Content
+    const geminiResponse = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        temperature: 0.1,
+        responseMimeType: "application/json",
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { fileData: { fileUri: uploadedFile.uri, mimeType: file.mimetype } },
+            { text: "Generate the psychiatric SOAP note JSON for this session recording." },
           ],
-        });
-      } catch (genErr) {
-        console.error("[Gemini] generateContent error:", genErr);
-        await ai.files.delete({ name: uploadedFile.name }).catch(() => {});
-        return res.status(502).json({ error: "Gemini content generation failed." });
-      }
+        },
+      ],
+    });
 
-      // ── 4. Delete remote Gemini file (no PHI retained on Google's staging) ──
-      await ai.files.delete({ name: uploadedFile.name }).catch((e) =>
-        console.warn("[Gemini] Remote file deletion warning:", e.message)
-      );
+    // 4. Parse the response
+    const rawText = geminiResponse.text;
+    const cleaned = rawText.replace(/^
+http://googleusercontent.com/immersive_entry_chip/0
 
-      // ── 5. Parse and validate the JSON response ──────────────────────────────
-      let soapNote;
-      try {
-        const rawText = geminiResponse.text;
-        // Strip accidental markdown fences that may slip through
-        const cleaned = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-        soapNote = JSON.parse(cleaned);
-      } catch (parseErr) {
-        console.error("[Parser] JSON parse error:", parseErr);
-        return res.status(500).json({
-          error: "Gemini returned malformed JSON.",
-          raw: geminiResponse.text, // send raw so the client can surface it for manual review
-        });
-      }
-
-      // ── 6. Return the structured note ────────────────────────────────────────
-      return res.status(200).json(soapNote);
-    } finally {
-      // ── HIPAA / DPDP: delete local temp file unconditionally ─────────────────
-      if (localPath) {
-        await fs.unlink(localPath).catch((e) =>
-          console.error("[Cleanup] Failed to delete local audio file:", e.message)
-        );
-      }
-    }
-  }
-);
-
-// ─── Multer error handler (must be registered after the route) ────────────────
-
-router.use((err, _req, res, _next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({ error: "Audio file exceeds the 2 GB size limit." });
-    }
-    return res.status(400).json({ error: `Upload error: ${err.message}` });
-  }
-  if (err?.status) {
-    return res.status(err.status).json({ error: err.message });
-  }
-  console.error("[Unhandled]", err);
-  return res.status(500).json({ error: "Internal server error." });
-});
-
-export default router;
+### Key Changes to Notice
+1. **Moved the HIPAA Cleanup:** The strict local file deletion (`fs.unlink`) now happens at the end of the `processAudioInBackground` function. This guarantees that even if the polling connection drops, the file is securely wiped from your server after processing.
+2. **Added Request Abort Protection:** I added a specific check in the error handler at the bottom for `Request aborted`. If a phone drops connection *during* the file upload, the server will log a simple warning instead of crashing.
