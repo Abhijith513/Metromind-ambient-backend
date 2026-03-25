@@ -14,6 +14,7 @@ import {
 import {
   transcribeSegment,
   generateSoapFromTranscript,
+  sanitizeFullTranscript,
 } from "../services/geminiService.js";
 
 const router = express.Router();
@@ -107,7 +108,7 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     });
 
     return res.status(500).json({
-      error: "Failed to process segment.",
+      error: err instanceof Error ? err.message : "Failed to process segment.",
     });
   }
 });
@@ -147,19 +148,24 @@ router.post("/sessions/:sessionId/finalize", async (req, res) => {
       .slice()
       .sort((a, b) => a.index - b.index);
 
-    const fullTranscript = orderedParts
+    const rawFullTranscript = orderedParts
       .map((p) => p.transcript)
       .filter(Boolean)
       .join("\n");
 
-    console.log(
-      `[Finalize] session=${sessionId} parts=${orderedParts.length} fullTranscriptChars=${fullTranscript.length}`
-    );
-    console.log("[FULL TRANSCRIPT START]");
-    console.log(fullTranscript || "[EMPTY FULL TRANSCRIPT]");
-    console.log("[FULL TRANSCRIPT END]");
+    const sanitizedFullTranscript = sanitizeFullTranscript(rawFullTranscript);
 
-    const finalNote = await generateSoapFromTranscript(fullTranscript);
+    console.log(
+      `[Finalize] session=${sessionId} parts=${orderedParts.length} rawFullTranscriptChars=${rawFullTranscript.length} sanitizedFullTranscriptChars=${sanitizedFullTranscript.length}`
+    );
+    console.log("[RAW FULL TRANSCRIPT START]");
+    console.log(rawFullTranscript || "[EMPTY RAW FULL TRANSCRIPT]");
+    console.log("[RAW FULL TRANSCRIPT END]");
+    console.log("[SANITIZED FULL TRANSCRIPT START]");
+    console.log(sanitizedFullTranscript || "[EMPTY SANITIZED FULL TRANSCRIPT]");
+    console.log("[SANITIZED FULL TRANSCRIPT END]");
+
+    const finalNote = await generateSoapFromTranscript(sanitizedFullTranscript);
 
     console.log("[FINAL SOAP NOTE]");
     console.log(JSON.stringify(finalNote, null, 2));
@@ -180,7 +186,7 @@ router.post("/sessions/:sessionId/finalize", async (req, res) => {
     });
 
     return res.status(500).json({
-      error: "Failed to finalize session.",
+      error: err instanceof Error ? err.message : "Failed to finalize session.",
     });
   }
 });

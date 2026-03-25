@@ -20,6 +20,90 @@ async function waitForFileActive(fileResource, { maxWaitMs = 120000, pollMs = 30
   throw new Error("Timed out waiting for Gemini file to become ACTIVE.");
 }
 
+function normalizeWhitespace(text) {
+  return (text ?? "")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function collapseRepeatedTokens(text) {
+  if (!text) return text;
+
+  let out = text;
+
+  out = out.replace(/\b(Mmm+|Hmm+|Uh+|Um+|Ah+)(?:[.,]?\s+\1){3,}\b/gi, "$1 [repeated]");
+  out = out.replace(
+    /(?:\[(?:unclear|unclear speech|breathing|breathing sounds|humming|sigh)\]\s*){3,}/gi,
+    "[repeated non-lexical audio] "
+  );
+  out = out.replace(/\b([A-Za-zÀ-ÿ\u0D00-\u0D7F']+)(?:[,\s]+\1){4,}\b/giu, "$1 [repeated]");
+  out = out.replace(/((?:\b[\p{L}\p{N}'-]+\b[\s,]*){1,4})(?:\s*\1){3,}/giu, "$1 [repeated] ");
+
+  return out;
+}
+
+function countMeaningfulWords(text) {
+  if (!text) return 0;
+  const words = text.match(/[\p{L}\p{N}'-]+/gu) ?? [];
+  return words.length;
+}
+
+function countNoiseMarkers(text) {
+  if (!text) return 0;
+  const matches = text.match(
+    /\[(?:unclear|unclear speech|breathing|breathing sounds|humming|sigh)\]|\b(?:mmm+|hmm+|uh+|um+|ah+)\b/gi
+  );
+  return matches ? matches.length : 0;
+}
+
+export function sanitizeTranscriptSegment(text) {
+  let out = normalizeWhitespace(text);
+  out = collapseRepeatedTokens(out);
+  out = normalizeWhitespace(out);
+
+  const meaningfulWords = countMeaningfulWords(out);
+  const noiseMarkers = countNoiseMarkers(out);
+
+  if (meaningfulWords <= 2 && noiseMarkers >= 2) {
+    return "";
+  }
+
+  if (meaningfulWords <= 4 && /^\[repeated non-lexical audio\]$/i.test(out)) {
+    return "";
+  }
+
+  if (
+    /^(?:ok(?:ay)?|right|hmm+|mmm+|yeah|yes|no|one second|just a second|hello)[.! ]*(?:\[repeated\])?$/i.test(
+      out
+    )
+  ) {
+    return "";
+  }
+
+  return out;
+}
+
+export function sanitizeFullTranscript(text) {
+  let out = normalizeWhitespace(text);
+  out = collapseRepeatedTokens(out);
+
+  const lines = out
+    .split("\n")
+    .map((line) => sanitizeTranscriptSegment(line))
+    .filter(Boolean);
+
+  out = lines.join("\n");
+  out = normalizeWhitespace(out);
+
+  if (out.length > 50000) {
+    out = out.slice(-50000);
+  }
+
+  return out;
+}
+
 export async function transcribeSegment(localPath, mimeType) {
   let uploadedFile;
 
@@ -61,6 +145,9 @@ Rules:
 - Do not invent details.
 - If a phrase is unclear, mark it as [unclear].
 - Include clinician and patient utterances in natural order when possible.
+- If the speaker repeats the same acknowledgment or filler many times, compress it rather than expanding it indefinitely.
+- If the segment is mostly non-lexical audio such as breathing, humming, or repeated fillers, return a minimal compact representation.
+- Do not output long runs of "Mmm", "Hmm", "[unclear]", or similar filler.
               `.trim(),
             },
           ],
@@ -71,7 +158,13 @@ Rules:
     console.log("[RAW SEGMENT MODEL TEXT]");
     console.log(response.text ?? "[NO RESPONSE TEXT]");
 
-    return response.text?.trim() ?? "";
+    const rawTranscript = response.text?.trim() ?? "";
+    const cleanedTranscript = sanitizeTranscriptSegment(rawTranscript);
+
+    console.log("[SANITIZED SEGMENT TEXT]");
+    console.log(cleanedTranscript || "[DROPPED AS JUNK SEGMENT]");
+
+    return cleanedTranscript;
   } finally {
     if (uploadedFile?.name) {
       await ai.files.delete({ name: uploadedFile.name }).catch(() => {});
@@ -216,6 +309,13 @@ Never invent unsupported clinical facts.
 `.trim();
 
 export async function generateSoapFromTranscript(fullTranscript) {
+  const sanitizedTranscript = sanitizeFullTranscript(fullTranscript);
+
+  console.log(`[SOAP INPUT] rawChars=${fullTranscript?.length ?? 0} sanitizedChars=${sanitizedTranscript.length}`);
+  console.log("[SANITIZED FULL TRANSCRIPT START]");
+  console.log(sanitizedTranscript || "[EMPTY SANITIZED FULL TRANSCRIPT]");
+  console.log("[SANITIZED FULL TRANSCRIPT END]");
+
   const response = await ai.models.generateContent({
     model: "gemini-2.5-flash",
     config: {
@@ -244,7 +344,7 @@ Important instructions:
 - If MSE can be partially inferred from speech/content, include those supported domains.
 
 Transcript:
-${fullTranscript}
+${sanitizedTranscript}
 `.trim(),
           },
         ],
@@ -262,5 +362,11 @@ ${fullTranscript}
     .replace(/\s*```$/, "")
     .trim();
 
-  return JSON.parse(cleaned);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    console.error("[SOAP JSON PARSE FAILED]");
+    console.error("Cleaned text:", cleaned);
+    throw new Error("Model returned invalid JSON during final note generation.");
+  }
 }
