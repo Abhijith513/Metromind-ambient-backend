@@ -7,6 +7,7 @@ import {
   createSession,
   getSession,
   appendTranscriptPart,
+  markSegmentReceived,
   setSessionStatus,
   setFinalNote,
   addSessionError,
@@ -57,16 +58,59 @@ function buildSegmentError({ stage, segmentIndex, message }) {
   };
 }
 
-router.post("/sessions", (_req, res) => {
-  const session = createSession();
+function formatDurationMs(startMs) {
+  return Math.max(0, Date.now() - startMs);
+}
+
+function logSegmentLifecycle({
+  phase,
+  requestId,
+  sessionId,
+  segmentIndex,
+  mimeType,
+  size,
+  durationMs,
+  transcriptLength,
+  message,
+}) {
+  const fields = [
+    `[Segment ${phase}]`,
+    `req=${requestId}`,
+    `session=${sessionId}`,
+    `index=${segmentIndex}`,
+  ];
+
+  if (mimeType) fields.push(`mime=${mimeType}`);
+  if (Number.isFinite(size)) fields.push(`size=${size}`);
+  if (Number.isFinite(durationMs)) fields.push(`ms=${durationMs}`);
+  if (Number.isFinite(transcriptLength)) fields.push(`chars=${transcriptLength}`);
+  if (message) fields.push(`message=${message}`);
+
+  console.log(fields.join(" "));
+}
+
+router.post("/sessions", (req, res) => {
+  const session = createSession({
+    patientName: req.body?.patientName,
+    chiefComplaint: req.body?.chiefComplaint,
+    preferredLanguage: req.body?.preferredLanguage,
+  });
+
   return res.status(201).json({
     sessionId: session.id,
     status: session.status,
+    preSession: {
+      patientName: session.patientName,
+      chiefComplaint: session.chiefComplaint,
+      preferredLanguage: session.preferredLanguage,
+    },
   });
 });
 
 router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req, res) => {
   const { sessionId } = req.params;
+  const requestId = randomUUID();
+  const receivedAtMs = Date.now();
   const rawSegmentIndex = req.body?.segmentIndex;
   const parsedProvidedSegmentIndex =
     rawSegmentIndex !== undefined && rawSegmentIndex !== null && rawSegmentIndex !== ""
@@ -114,18 +158,40 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     });
   }
 
+  logSegmentLifecycle({
+    phase: "received",
+    requestId,
+    sessionId,
+    segmentIndex,
+    mimeType: req.file.mimetype,
+    size: req.file.size,
+  });
+
   try {
+    markSegmentReceived(sessionId);
     setSessionStatus(sessionId, "processing_segments");
 
-    console.log(
-      `[Segment upload] session=${sessionId} index=${segmentIndex} mime=${req.file.mimetype} size=${req.file.size}`
-    );
+    logSegmentLifecycle({
+      phase: "transcription_started",
+      requestId,
+      sessionId,
+      segmentIndex,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+      durationMs: formatDurationMs(receivedAtMs),
+    });
 
     const transcript = await transcribeSegment(req.file.path, req.file.mimetype);
 
-    console.log(
-      `[Segment transcript] session=${sessionId} index=${segmentIndex} chars=${transcript?.length ?? 0}`
-    );
+    const processingMs = formatDurationMs(receivedAtMs);
+    logSegmentLifecycle({
+      phase: "transcription_finished",
+      requestId,
+      sessionId,
+      segmentIndex,
+      durationMs: processingMs,
+      transcriptLength: transcript?.length ?? 0,
+    });
     console.log(transcript || "[EMPTY TRANSCRIPT]");
 
     appendTranscriptPart(sessionId, {
@@ -139,9 +205,18 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
       status: "recording",
       segmentIndex,
       transcriptLength: transcript?.length ?? 0,
+      processingMs,
     });
   } catch (err) {
-    console.error(`[Segment failure] session=${sessionId} index=${segmentIndex}`, err);
+    logSegmentLifecycle({
+      phase: "failed",
+      requestId,
+      sessionId,
+      segmentIndex,
+      durationMs: formatDurationMs(receivedAtMs),
+      message: err instanceof Error ? err.message : "Unknown error",
+    });
+    console.error(`[Segment failure] req=${requestId} session=${sessionId} index=${segmentIndex}`, err);
 
     addSessionError(sessionId, {
       stage: "segment_transcription",
@@ -157,6 +232,8 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
         message: err instanceof Error ? err.message : "Failed to process segment.",
       }),
     });
+  } finally {
+    await cleanupUploadedFile(req.file?.path);
   }
 });
 
@@ -171,6 +248,23 @@ router.get("/sessions/:sessionId/status", (req, res) => {
     sessionId: session.id,
     status: session.status,
     segmentCount: session.segmentCount,
+    preSession: {
+      patientName: session.patientName ?? null,
+      chiefComplaint: session.chiefComplaint ?? null,
+      preferredLanguage: session.preferredLanguage ?? null,
+    },
+    segmentProcessing: {
+      receivedSegmentCount: session.receivedSegmentCount ?? session.segmentCount ?? 0,
+      transcribedSegmentCount: session.transcribedSegmentCount ?? session.segmentCount ?? 0,
+      failedSegmentCount: session.failedSegmentCount ?? 0,
+      lastProcessedSegmentIndex: session.lastProcessedSegmentIndex ?? null,
+      inFlightSegmentCount: Math.max(
+        0,
+        (session.receivedSegmentCount ?? session.segmentCount ?? 0) -
+          (session.transcribedSegmentCount ?? session.segmentCount ?? 0) -
+          (session.failedSegmentCount ?? 0)
+      ),
+    },
     hasResult: !!session.finalNote,
     errors: session.errors,
   });

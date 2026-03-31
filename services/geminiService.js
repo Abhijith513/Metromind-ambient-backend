@@ -1,4 +1,3 @@
-import fs from "fs/promises";
 import { GoogleGenAI } from "@google/genai";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -169,7 +168,6 @@ Rules:
     if (uploadedFile?.name) {
       await ai.files.delete({ name: uploadedFile.name }).catch(() => {});
     }
-    await fs.unlink(localPath).catch(() => {});
   }
 }
 
