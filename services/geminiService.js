@@ -206,10 +206,14 @@ You must actively listen for symptoms mapping to the following scales:
 
 Do NOT invent numerical scores unless explicitly dictated by the clinician.
 Instead:
-- map endorsed symptoms to relevant scales
-- estimate narrative severity from the transcript
-- list missing domains still needing assessment
-- note that ACE-III drawing/reading components cannot be inferred from audio alone unless explicitly discussed
+- ALWAYS include all 7 listed scales in psychometric_analysis, even when relevance is low.
+- map symptoms only when transcript evidence is reasonably direct (quoted statements, clear clinician probing, or explicit observed behavior in transcript).
+- for indirect evidence, use tentative wording such as "possible", "suggested by", and "requires clinician confirmation".
+- do NOT promote indirect clues to confident severity labels.
+- when severity cannot be responsibly inferred, set narrative_severity_estimate to exactly: "cannot be estimated from transcript alone".
+- for ACE-III and other structured cognitive testing domains, do NOT infer cognitive severity from psychotic symptoms, mood distress, anxiety, agitation, or general functional complaints alone.
+- for ACE-III specifically, unless direct structured cognitive test performance is described, narrative_severity_estimate must be exactly "cannot be estimated from transcript alone".
+- list missing domains still needing assessment for each scale.
 
 Return ONLY a valid JSON object matching this exact schema:
 
