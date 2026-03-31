@@ -118,6 +118,21 @@ function buildSegmentLifecycleSummary(segmentEntries) {
   return summary;
 }
 
+function buildSegmentDebugDetails(entries) {
+  return entries.map((entry) => ({
+    segmentIndex: entry.segmentIndex,
+    state: entry.state,
+    attemptCount: entry.attemptCount ?? 0,
+    maxAttempts: entry.maxAttempts ?? 3,
+    requestId: entry.requestId ?? null,
+    queuedAt: entry.queuedAt ?? null,
+    startedAt: entry.startedAt ?? null,
+    completedAt: entry.completedAt ?? null,
+    processingMs: entry.processingMs ?? null,
+    lastError: entry.lastError ?? null,
+  }));
+}
+
 const SEGMENT_WORKER_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_WORKER_CONCURRENCY ?? 2));
 let activeSegmentWorkers = 0;
 let workerLoopScheduled = false;
@@ -396,6 +411,36 @@ router.post("/sessions/:sessionId/finalize", async (req, res) => {
 
   if (!session) {
     return res.status(404).json({ error: "Session not found." });
+  }
+
+  const segmentEntries = toSortedSegmentEntries(session);
+  const pendingSegments = segmentEntries.filter((entry) =>
+    ["queued", "processing", "retry_scheduled"].includes(entry.state)
+  );
+  const failedSegments = segmentEntries.filter((entry) => entry.state === "failed");
+
+  if (pendingSegments.length > 0) {
+    return res.status(409).json({
+      error: {
+        code: "SEGMENTS_PENDING",
+        message: "Cannot finalize while one or more segments are still pending transcription.",
+        sessionId,
+        pendingSegmentIndices: pendingSegments.map((entry) => entry.segmentIndex),
+        pendingSegments: buildSegmentDebugDetails(pendingSegments),
+      },
+    });
+  }
+
+  if (failedSegments.length > 0) {
+    return res.status(409).json({
+      error: {
+        code: "SEGMENTS_FAILED",
+        message: "Cannot finalize because one or more segments failed transcription.",
+        sessionId,
+        failedSegmentIndices: failedSegments.map((entry) => entry.segmentIndex),
+        failedSegments: buildSegmentDebugDetails(failedSegments),
+      },
+    });
   }
 
   if (!session.transcriptParts.length) {
