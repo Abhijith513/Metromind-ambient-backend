@@ -7,6 +7,11 @@ import {
   createSession,
   getSession,
   appendTranscriptPart,
+  markSegmentReceived,
+  markSegmentQueued,
+  markSegmentProcessing,
+  markSegmentTranscribed,
+  markSegmentFailed,
   setSessionStatus,
   setFinalNote,
   addSessionError,
@@ -57,16 +62,84 @@ function buildSegmentError({ stage, segmentIndex, message }) {
   };
 }
 
-router.post("/sessions", (_req, res) => {
-  const session = createSession();
+function formatDurationMs(startMs) {
+  return Math.max(0, Date.now() - startMs);
+}
+
+function logSegmentLifecycle({
+  phase,
+  requestId,
+  sessionId,
+  segmentIndex,
+  mimeType,
+  size,
+  durationMs,
+  transcriptLength,
+  message,
+}) {
+  const fields = [
+    `[Segment ${phase}]`,
+    `req=${requestId}`,
+    `session=${sessionId}`,
+    `index=${segmentIndex}`,
+  ];
+
+  if (mimeType) fields.push(`mime=${mimeType}`);
+  if (Number.isFinite(size)) fields.push(`size=${size}`);
+  if (Number.isFinite(durationMs)) fields.push(`ms=${durationMs}`);
+  if (Number.isFinite(transcriptLength)) fields.push(`chars=${transcriptLength}`);
+  if (message) fields.push(`message=${message}`);
+
+  console.log(fields.join(" "));
+}
+
+function toSortedSegmentEntries(session) {
+  const entries = Object.values(session.segmentRegistry ?? {});
+  return entries.sort((a, b) => (a.segmentIndex ?? 0) - (b.segmentIndex ?? 0));
+}
+
+function buildSegmentLifecycleSummary(segmentEntries) {
+  const summary = {
+    queuedCount: 0,
+    processingCount: 0,
+    transcribedCount: 0,
+    failedCount: 0,
+    retryScheduledCount: 0,
+  };
+
+  for (const entry of segmentEntries) {
+    if (entry?.state === "queued") summary.queuedCount += 1;
+    else if (entry?.state === "processing") summary.processingCount += 1;
+    else if (entry?.state === "transcribed") summary.transcribedCount += 1;
+    else if (entry?.state === "failed") summary.failedCount += 1;
+    else if (entry?.state === "retry_scheduled") summary.retryScheduledCount += 1;
+  }
+
+  return summary;
+}
+
+router.post("/sessions", (req, res) => {
+  const session = createSession({
+    patientName: req.body?.patientName,
+    chiefComplaint: req.body?.chiefComplaint,
+    preferredLanguage: req.body?.preferredLanguage,
+  });
+
   return res.status(201).json({
     sessionId: session.id,
     status: session.status,
+    preSession: {
+      patientName: session.patientName,
+      chiefComplaint: session.chiefComplaint,
+      preferredLanguage: session.preferredLanguage,
+    },
   });
 });
 
 router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req, res) => {
   const { sessionId } = req.params;
+  const requestId = randomUUID();
+  const receivedAtMs = Date.now();
   const rawSegmentIndex = req.body?.segmentIndex;
   const parsedProvidedSegmentIndex =
     rawSegmentIndex !== undefined && rawSegmentIndex !== null && rawSegmentIndex !== ""
@@ -114,18 +187,51 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     });
   }
 
-  try {
-    setSessionStatus(sessionId, "processing_segments");
+  logSegmentLifecycle({
+    phase: "received",
+    requestId,
+    sessionId,
+    segmentIndex,
+    mimeType: req.file.mimetype,
+    size: req.file.size,
+  });
 
-    console.log(
-      `[Segment upload] session=${sessionId} index=${segmentIndex} mime=${req.file.mimetype} size=${req.file.size}`
-    );
+  markSegmentQueued(sessionId, {
+    segmentIndex,
+    requestId,
+    queuedAt: new Date(receivedAtMs).toISOString(),
+  });
+
+  try {
+    markSegmentReceived(sessionId);
+    setSessionStatus(sessionId, "processing_segments");
+    markSegmentProcessing(sessionId, {
+      segmentIndex,
+      requestId,
+      startedAt: new Date().toISOString(),
+    });
+
+    logSegmentLifecycle({
+      phase: "transcription_started",
+      requestId,
+      sessionId,
+      segmentIndex,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+      durationMs: formatDurationMs(receivedAtMs),
+    });
 
     const transcript = await transcribeSegment(req.file.path, req.file.mimetype);
 
-    console.log(
-      `[Segment transcript] session=${sessionId} index=${segmentIndex} chars=${transcript?.length ?? 0}`
-    );
+    const processingMs = formatDurationMs(receivedAtMs);
+    logSegmentLifecycle({
+      phase: "transcription_finished",
+      requestId,
+      sessionId,
+      segmentIndex,
+      durationMs: processingMs,
+      transcriptLength: transcript?.length ?? 0,
+    });
     console.log(transcript || "[EMPTY TRANSCRIPT]");
 
     appendTranscriptPart(sessionId, {
@@ -133,21 +239,48 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
       transcript,
       receivedAt: new Date().toISOString(),
     });
+    markSegmentTranscribed(sessionId, {
+      segmentIndex,
+      requestId,
+      completedAt: new Date().toISOString(),
+      processingMs,
+      transcript,
+    });
 
     return res.status(202).json({
       ok: true,
       status: "recording",
       segmentIndex,
       transcriptLength: transcript?.length ?? 0,
+      processingMs,
     });
   } catch (err) {
-    console.error(`[Segment failure] session=${sessionId} index=${segmentIndex}`, err);
+    logSegmentLifecycle({
+      phase: "failed",
+      requestId,
+      sessionId,
+      segmentIndex,
+      durationMs: formatDurationMs(receivedAtMs),
+      message: err instanceof Error ? err.message : "Unknown error",
+    });
+    console.error(`[Segment failure] req=${requestId} session=${sessionId} index=${segmentIndex}`, err);
 
     addSessionError(sessionId, {
       stage: "segment_transcription",
       message: err instanceof Error ? err.message : "Unknown error",
       segmentIndex,
       at: new Date().toISOString(),
+    });
+    markSegmentFailed(sessionId, {
+      segmentIndex,
+      requestId,
+      completedAt: new Date().toISOString(),
+      processingMs: formatDurationMs(receivedAtMs),
+      error: {
+        stage: "segment_transcription",
+        message: err instanceof Error ? err.message : "Unknown error",
+        at: new Date().toISOString(),
+      },
     });
 
     return res.status(500).json({
@@ -157,6 +290,8 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
         message: err instanceof Error ? err.message : "Failed to process segment.",
       }),
     });
+  } finally {
+    await cleanupUploadedFile(req.file?.path);
   }
 });
 
@@ -167,10 +302,44 @@ router.get("/sessions/:sessionId/status", (req, res) => {
     return res.status(404).json({ error: "Session not found." });
   }
 
+  const segmentEntries = toSortedSegmentEntries(session);
+
   return res.json({
     sessionId: session.id,
     status: session.status,
     segmentCount: session.segmentCount,
+    preSession: {
+      patientName: session.patientName ?? null,
+      chiefComplaint: session.chiefComplaint ?? null,
+      preferredLanguage: session.preferredLanguage ?? null,
+    },
+    segmentProcessing: {
+      receivedSegmentCount: session.receivedSegmentCount ?? session.segmentCount ?? 0,
+      transcribedSegmentCount: session.transcribedSegmentCount ?? session.segmentCount ?? 0,
+      failedSegmentCount: session.failedSegmentCount ?? 0,
+      lastProcessedSegmentIndex: session.lastProcessedSegmentIndex ?? null,
+      inFlightSegmentCount: Math.max(
+        0,
+        (session.receivedSegmentCount ?? session.segmentCount ?? 0) -
+          (session.transcribedSegmentCount ?? session.segmentCount ?? 0) -
+          (session.failedSegmentCount ?? 0)
+      ),
+    },
+    segmentLifecycleSummary: buildSegmentLifecycleSummary(segmentEntries),
+    segments: segmentEntries.map((entry) => ({
+      segmentIndex: entry.segmentIndex,
+      state: entry.state,
+      attemptCount: entry.attemptCount ?? 0,
+      maxAttempts: entry.maxAttempts ?? 3,
+      requestId: entry.requestId ?? null,
+      queuedAt: entry.queuedAt ?? null,
+      startedAt: entry.startedAt ?? null,
+      completedAt: entry.completedAt ?? null,
+      processingMs: entry.processingMs ?? null,
+      hasTranscript: typeof entry.transcript === "string",
+      transcriptLength: entry.transcript?.length ?? 0,
+      lastError: entry.lastError ?? null,
+    })),
     hasResult: !!session.finalNote,
     errors: session.errors,
   });
