@@ -24,8 +24,12 @@ await fs.mkdir(UPLOAD_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: async (_req, _file, cb) => {
-    await fs.mkdir(UPLOAD_DIR, { recursive: true });
-    cb(null, UPLOAD_DIR);
+    try {
+      await fs.mkdir(UPLOAD_DIR, { recursive: true });
+      cb(null, UPLOAD_DIR);
+    } catch (err) {
+      cb(err);
+    }
   },
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase() || ".webm";
@@ -40,6 +44,19 @@ const upload = multer({
   },
 });
 
+async function cleanupUploadedFile(filePath) {
+  if (!filePath) return;
+  await fs.unlink(filePath).catch(() => {});
+}
+
+function buildSegmentError({ stage, segmentIndex, message }) {
+  return {
+    stage,
+    segmentIndex,
+    message,
+  };
+}
+
 router.post("/sessions", (_req, res) => {
   const session = createSession();
   return res.status(201).json({
@@ -50,26 +67,51 @@ router.post("/sessions", (_req, res) => {
 
 router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req, res) => {
   const { sessionId } = req.params;
+  const rawSegmentIndex = req.body?.segmentIndex;
+  const parsedProvidedSegmentIndex =
+    rawSegmentIndex !== undefined && rawSegmentIndex !== null && rawSegmentIndex !== ""
+      ? Number(rawSegmentIndex)
+      : null;
+  const providedSegmentIndex = Number.isFinite(parsedProvidedSegmentIndex)
+    ? parsedProvidedSegmentIndex
+    : null;
   const session = getSession(sessionId);
 
   if (!session) {
-    if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
-    return res.status(404).json({ error: "Session not found." });
+    await cleanupUploadedFile(req.file?.path);
+    return res.status(404).json({
+      error: buildSegmentError({
+        stage: "session_lookup",
+        segmentIndex: providedSegmentIndex,
+        message: "Session not found.",
+      }),
+    });
   }
 
   if (!req.file) {
-    return res.status(400).json({ error: "No audio segment received." });
+    return res.status(400).json({
+      error: buildSegmentError({
+        stage: "request_validation",
+        segmentIndex: providedSegmentIndex ?? session.segmentCount,
+        message: "No audio segment received.",
+      }),
+    });
   }
 
-  const rawSegmentIndex = req.body?.segmentIndex;
   const segmentIndex =
     rawSegmentIndex !== undefined && rawSegmentIndex !== null && rawSegmentIndex !== ""
       ? Number(rawSegmentIndex)
       : session.segmentCount;
 
-  if (!Number.isFinite(segmentIndex)) {
-    if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
-    return res.status(400).json({ error: "Invalid segmentIndex." });
+  if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+    await cleanupUploadedFile(req.file?.path);
+    return res.status(400).json({
+      error: buildSegmentError({
+        stage: "request_validation",
+        segmentIndex: providedSegmentIndex,
+        message: "Invalid segmentIndex. Expected a non-negative integer.",
+      }),
+    });
   }
 
   try {
@@ -104,11 +146,16 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     addSessionError(sessionId, {
       stage: "segment_transcription",
       message: err instanceof Error ? err.message : "Unknown error",
+      segmentIndex,
       at: new Date().toISOString(),
     });
 
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Failed to process segment.",
+      error: buildSegmentError({
+        stage: "segment_transcription",
+        segmentIndex,
+        message: err instanceof Error ? err.message : "Failed to process segment.",
+      }),
     });
   }
 });
