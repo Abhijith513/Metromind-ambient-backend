@@ -12,6 +12,8 @@ import {
   markSegmentFailed,
   enqueueSegmentForProcessing,
   claimNextQueuedSegmentJob,
+  retryFailedSegmentForProcessing,
+  getSegmentEntry,
   setSessionStatus,
   setFinalNote,
   addSessionError,
@@ -146,6 +148,7 @@ function scheduleSegmentWorkerLoop() {
 async function processSegmentJob(job) {
   const { sessionId, segmentIndex, requestId, localFilePath, mimeType, size, startedAt } = job;
   const startedAtMs = startedAt ? Date.parse(startedAt) : Date.now();
+  let shouldCleanupLocalFile = true;
 
   logSegmentLifecycle({
     phase: "transcription_started",
@@ -192,12 +195,14 @@ async function processSegmentJob(job) {
       requestId,
       completedAt: errorAt,
       processingMs,
+      localFilePath,
       error: {
         stage: "segment_transcription",
         message: err instanceof Error ? err.message : "Unknown error",
         at: errorAt,
       },
     });
+    shouldCleanupLocalFile = false;
     addSessionError(sessionId, {
       stage: "segment_transcription",
       message: err instanceof Error ? err.message : "Unknown error",
@@ -215,7 +220,9 @@ async function processSegmentJob(job) {
     });
     console.error(`[Segment failure] req=${requestId} session=${sessionId} index=${segmentIndex}`, err);
   } finally {
-    await cleanupUploadedFile(localFilePath);
+    if (shouldCleanupLocalFile) {
+      await cleanupUploadedFile(localFilePath);
+    }
   }
 }
 
@@ -352,6 +359,78 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     segmentIndex,
     requestId,
     replacedExistingQueueItem: !!enqueueResult.replacedExistingQueueItem,
+  });
+});
+
+router.post("/sessions/:sessionId/segments/:segmentIndex/retry", async (req, res) => {
+  const { sessionId } = req.params;
+  const segmentIndex = Number(req.params.segmentIndex);
+  const requestId = randomUUID();
+
+  if (!Number.isInteger(segmentIndex) || segmentIndex < 0) {
+    return res.status(400).json({
+      error: buildSegmentError({
+        stage: "request_validation",
+        segmentIndex: Number.isFinite(segmentIndex) ? segmentIndex : null,
+        message: "Invalid segmentIndex. Expected a non-negative integer.",
+      }),
+    });
+  }
+
+  const session = getSession(sessionId);
+  if (!session) {
+    return res.status(404).json({
+      error: buildSegmentError({
+        stage: "session_lookup",
+        segmentIndex,
+        message: "Session not found.",
+      }),
+    });
+  }
+
+  const segmentEntry = getSegmentEntry(sessionId, segmentIndex);
+  if (!segmentEntry) {
+    return res.status(404).json({
+      error: buildSegmentError({
+        stage: "segment_lookup",
+        segmentIndex,
+        message: "Segment not found in this session.",
+      }),
+    });
+  }
+
+  const retryResult = retryFailedSegmentForProcessing(sessionId, {
+    segmentIndex,
+    requestId,
+    queuedAt: new Date().toISOString(),
+  });
+
+  if (!retryResult?.ok) {
+    const statusCode = retryResult.code === "SEGMENT_NOT_FAILED" ? 409 : 422;
+    return res.status(statusCode).json({
+      error: {
+        ...buildSegmentError({
+          stage: "segment_retry",
+          segmentIndex,
+          message: retryResult.message ?? "Failed to retry segment.",
+        }),
+        code: retryResult.code,
+        state: retryResult.state ?? segmentEntry.state ?? null,
+      },
+    });
+  }
+
+  setSessionStatus(sessionId, "processing_segments");
+  scheduleSegmentWorkerLoop();
+
+  return res.status(202).json({
+    ok: true,
+    status: "queued_for_retry",
+    sessionId,
+    segmentIndex,
+    requestId,
+    attemptCount: retryResult.attemptCount ?? segmentEntry.attemptCount ?? 0,
+    maxAttempts: retryResult.maxAttempts ?? segmentEntry.maxAttempts ?? 3,
   });
 });
 

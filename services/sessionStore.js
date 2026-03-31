@@ -70,6 +70,12 @@ export function getSession(id) {
   return sessions.get(id) ?? null;
 }
 
+export function getSegmentEntry(id, segmentIndex) {
+  const session = getSession(id);
+  if (!session) return null;
+  return session.segmentRegistry?.[String(segmentIndex)] ?? null;
+}
+
 export function updateSession(id, updater) {
   const existing = sessions.get(id);
   if (!existing) return null;
@@ -257,6 +263,67 @@ export function claimNextQueuedSegmentJob() {
   return claimedJob;
 }
 
+export function retryFailedSegmentForProcessing(id, { segmentIndex, requestId, queuedAt }) {
+  const session = getSession(id);
+  if (!session) {
+    return { ok: false, code: "SESSION_NOT_FOUND", message: "Session not found." };
+  }
+
+  const key = String(segmentIndex);
+  const entry = session.segmentRegistry?.[key];
+  if (!entry) {
+    return { ok: false, code: "SEGMENT_NOT_FOUND", message: "Segment not found in registry." };
+  }
+
+  if (entry.state !== "failed") {
+    return {
+      ok: false,
+      code: "SEGMENT_NOT_FAILED",
+      message: `Segment cannot be retried from state '${entry.state}'.`,
+      state: entry.state,
+    };
+  }
+
+  if (!entry.localFilePath) {
+    return {
+      ok: false,
+      code: "SEGMENT_SOURCE_MISSING",
+      message: "Retry source audio is no longer available for this failed segment.",
+      state: entry.state,
+    };
+  }
+
+  const nextSession = updateSession(id, (s) => ({
+    ...s,
+    segmentRegistry: {
+      ...s.segmentRegistry,
+      [key]: {
+        ...s.segmentRegistry[key],
+        state: "queued",
+        requestId: requestId ?? s.segmentRegistry[key].requestId ?? null,
+        queuedAt: queuedAt ?? new Date().toISOString(),
+        startedAt: null,
+        completedAt: null,
+        processingMs: null,
+        lastError: null,
+      },
+    },
+    segmentQueue: [...(s.segmentQueue ?? []).filter((idx) => idx !== segmentIndex), segmentIndex],
+  }));
+
+  if (!nextSession) {
+    return { ok: false, code: "SESSION_NOT_FOUND", message: "Session not found." };
+  }
+
+  return {
+    ok: true,
+    state: "queued",
+    segmentIndex,
+    attemptCount: nextSession.segmentRegistry?.[key]?.attemptCount ?? entry.attemptCount ?? 0,
+    maxAttempts: nextSession.segmentRegistry?.[key]?.maxAttempts ?? entry.maxAttempts ?? 3,
+  };
+}
+
 export function markSegmentProcessing(id, { segmentIndex, requestId, startedAt }) {
   return updateSession(id, (s) => ({
     ...s,
@@ -289,7 +356,7 @@ export function markSegmentTranscribed(id, { segmentIndex, requestId, completedA
   }));
 }
 
-export function markSegmentFailed(id, { segmentIndex, requestId, completedAt, processingMs, error }) {
+export function markSegmentFailed(id, { segmentIndex, requestId, completedAt, processingMs, error, localFilePath }) {
   return updateSession(id, (s) => ({
     ...s,
     segmentRegistry: upsertSegmentRegistryEntry(s, segmentIndex, (entry) => ({
@@ -298,7 +365,7 @@ export function markSegmentFailed(id, { segmentIndex, requestId, completedAt, pr
       requestId: requestId ?? entry.requestId ?? null,
       completedAt: completedAt ?? new Date().toISOString(),
       processingMs: Number.isFinite(processingMs) ? processingMs : entry.processingMs ?? null,
-      localFilePath: null,
+      localFilePath: localFilePath ?? entry.localFilePath ?? null,
       lastError: error
         ? {
             stage: error.stage ?? "segment_transcription",
