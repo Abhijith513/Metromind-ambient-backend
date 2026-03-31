@@ -30,6 +30,7 @@ export function createSession(metadata = {}) {
     chiefComplaint: normalizeOptionalText(metadata.chiefComplaint),
     preferredLanguage: normalizeOptionalText(metadata.preferredLanguage),
     segmentRegistry: {},
+    segmentQueue: [],
   };
 
   sessions.set(id, session);
@@ -50,6 +51,9 @@ function upsertSegmentRegistryEntry(session, segmentIndex, updater) {
     completedAt: null,
     processingMs: null,
     transcript: null,
+    localFilePath: null,
+    mimeType: null,
+    size: null,
   };
   const next = updater(existing);
 
@@ -120,6 +124,139 @@ export function markSegmentQueued(id, { segmentIndex, requestId, queuedAt, maxAt
   }));
 }
 
+export function enqueueSegmentForProcessing(
+  id,
+  { segmentIndex, requestId, queuedAt, maxAttempts = 3, localFilePath, mimeType, size }
+) {
+  const existing = getSession(id);
+  if (!existing) {
+    return { ok: false, code: "SESSION_NOT_FOUND", message: "Session not found." };
+  }
+
+  const currentEntry = existing.segmentRegistry?.[String(segmentIndex)] ?? null;
+  const currentState = currentEntry?.state ?? null;
+
+  if (currentState === "processing") {
+    return {
+      ok: false,
+      code: "SEGMENT_ALREADY_PROCESSING",
+      message: "Segment is already being processed.",
+      state: currentState,
+    };
+  }
+
+  if (currentState === "transcribed") {
+    return {
+      ok: false,
+      code: "SEGMENT_ALREADY_TRANSCRIBED",
+      message: "Segment already has a transcript.",
+      state: currentState,
+    };
+  }
+
+  const replacedFilePath = currentState === "queued" ? currentEntry?.localFilePath ?? null : null;
+  const enqueueResult = updateSession(id, (s) => {
+    const key = String(segmentIndex);
+    const previous = s.segmentRegistry?.[key] ?? null;
+
+    const nextEntry = {
+      ...(previous ?? {}),
+      segmentIndex,
+      state: "queued",
+      requestId: requestId ?? previous?.requestId ?? null,
+      queuedAt: queuedAt ?? new Date().toISOString(),
+      maxAttempts: Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : previous?.maxAttempts ?? 3,
+      lastError: null,
+      completedAt: null,
+      processingMs: null,
+      transcript: null,
+      localFilePath: localFilePath ?? previous?.localFilePath ?? null,
+      mimeType: mimeType ?? previous?.mimeType ?? null,
+      size: Number.isFinite(size) ? size : previous?.size ?? null,
+      attemptCount: previous?.attemptCount ?? 0,
+      startedAt: null,
+    };
+
+    const queueWithoutIndex = (s.segmentQueue ?? []).filter((idx) => idx !== segmentIndex);
+
+    return {
+      ...s,
+      segmentRegistry: {
+        ...s.segmentRegistry,
+        [key]: nextEntry,
+      },
+      segmentQueue: [...queueWithoutIndex, segmentIndex],
+    };
+  });
+
+  if (!enqueueResult) {
+    return { ok: false, code: "SESSION_NOT_FOUND", message: "Session not found." };
+  }
+
+  return {
+    ok: true,
+    state: "queued",
+    replacedExistingQueueItem: currentState === "queued",
+    replacedFilePath: replacedFilePath && replacedFilePath !== localFilePath ? replacedFilePath : null,
+  };
+}
+
+export function claimNextQueuedSegmentJob() {
+  let claimedJob = null;
+
+  for (const [sessionId, session] of sessions.entries()) {
+    const queue = session.segmentQueue ?? [];
+    if (!queue.length) continue;
+
+    const segmentIndex = queue[0];
+    const key = String(segmentIndex);
+    const entry = session.segmentRegistry?.[key];
+    if (!entry || entry.state !== "queued" || !entry.localFilePath) {
+      updateSession(sessionId, (s) => ({
+        ...s,
+        segmentQueue: (s.segmentQueue ?? []).slice(1),
+      }));
+      continue;
+    }
+
+    const startedAt = new Date().toISOString();
+    updateSession(sessionId, (s) => {
+      const current = s.segmentRegistry?.[key];
+      if (!current || current.state !== "queued") return s;
+
+      return {
+        ...s,
+        segmentQueue: (s.segmentQueue ?? []).slice(1),
+        segmentRegistry: {
+          ...s.segmentRegistry,
+          [key]: {
+            ...current,
+            state: "processing",
+            startedAt,
+            completedAt: null,
+            processingMs: null,
+            attemptCount: (current.attemptCount ?? 0) + 1,
+            lastError: null,
+          },
+        },
+      };
+    });
+
+    claimedJob = {
+      sessionId,
+      segmentIndex,
+      requestId: entry.requestId ?? null,
+      localFilePath: entry.localFilePath,
+      mimeType: entry.mimeType,
+      size: entry.size,
+      startedAt,
+    };
+    break;
+  }
+
+  return claimedJob;
+}
+
 export function markSegmentProcessing(id, { segmentIndex, requestId, startedAt }) {
   return updateSession(id, (s) => ({
     ...s,
@@ -146,6 +283,7 @@ export function markSegmentTranscribed(id, { segmentIndex, requestId, completedA
       completedAt: completedAt ?? new Date().toISOString(),
       processingMs: Number.isFinite(processingMs) ? processingMs : entry.processingMs ?? null,
       transcript: typeof transcript === "string" ? transcript : entry.transcript ?? null,
+      localFilePath: null,
       lastError: null,
     })),
   }));
@@ -160,6 +298,7 @@ export function markSegmentFailed(id, { segmentIndex, requestId, completedAt, pr
       requestId: requestId ?? entry.requestId ?? null,
       completedAt: completedAt ?? new Date().toISOString(),
       processingMs: Number.isFinite(processingMs) ? processingMs : entry.processingMs ?? null,
+      localFilePath: null,
       lastError: error
         ? {
             stage: error.stage ?? "segment_transcription",

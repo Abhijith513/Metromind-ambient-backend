@@ -8,10 +8,10 @@ import {
   getSession,
   appendTranscriptPart,
   markSegmentReceived,
-  markSegmentQueued,
-  markSegmentProcessing,
   markSegmentTranscribed,
   markSegmentFailed,
+  enqueueSegmentForProcessing,
+  claimNextQueuedSegmentJob,
   setSessionStatus,
   setFinalNote,
   addSessionError,
@@ -118,6 +118,111 @@ function buildSegmentLifecycleSummary(segmentEntries) {
   return summary;
 }
 
+const SEGMENT_WORKER_CONCURRENCY = Math.max(1, Number(process.env.SEGMENT_WORKER_CONCURRENCY ?? 2));
+let activeSegmentWorkers = 0;
+let workerLoopScheduled = false;
+
+function scheduleSegmentWorkerLoop() {
+  if (workerLoopScheduled) return;
+  workerLoopScheduled = true;
+  setImmediate(runSegmentWorkerLoop);
+}
+
+async function processSegmentJob(job) {
+  const { sessionId, segmentIndex, requestId, localFilePath, mimeType, size, startedAt } = job;
+  const startedAtMs = startedAt ? Date.parse(startedAt) : Date.now();
+
+  logSegmentLifecycle({
+    phase: "transcription_started",
+    requestId: requestId ?? "n/a",
+    sessionId,
+    segmentIndex,
+    mimeType,
+    size,
+    durationMs: Number.isFinite(startedAtMs) ? formatDurationMs(startedAtMs) : undefined,
+  });
+
+  try {
+    const transcript = await transcribeSegment(localFilePath, mimeType);
+    const processingMs = Number.isFinite(startedAtMs) ? formatDurationMs(startedAtMs) : null;
+
+    appendTranscriptPart(sessionId, {
+      index: segmentIndex,
+      transcript,
+      receivedAt: new Date().toISOString(),
+    });
+    markSegmentTranscribed(sessionId, {
+      segmentIndex,
+      requestId,
+      completedAt: new Date().toISOString(),
+      processingMs,
+      transcript,
+    });
+
+    logSegmentLifecycle({
+      phase: "transcription_finished",
+      requestId: requestId ?? "n/a",
+      sessionId,
+      segmentIndex,
+      durationMs: processingMs ?? undefined,
+      transcriptLength: transcript?.length ?? 0,
+    });
+    console.log(transcript || "[EMPTY TRANSCRIPT]");
+  } catch (err) {
+    const errorAt = new Date().toISOString();
+    const processingMs = Number.isFinite(startedAtMs) ? formatDurationMs(startedAtMs) : null;
+
+    markSegmentFailed(sessionId, {
+      segmentIndex,
+      requestId,
+      completedAt: errorAt,
+      processingMs,
+      error: {
+        stage: "segment_transcription",
+        message: err instanceof Error ? err.message : "Unknown error",
+        at: errorAt,
+      },
+    });
+    addSessionError(sessionId, {
+      stage: "segment_transcription",
+      message: err instanceof Error ? err.message : "Unknown error",
+      segmentIndex,
+      at: errorAt,
+    });
+
+    logSegmentLifecycle({
+      phase: "failed",
+      requestId: requestId ?? "n/a",
+      sessionId,
+      segmentIndex,
+      durationMs: processingMs ?? undefined,
+      message: err instanceof Error ? err.message : "Unknown error",
+    });
+    console.error(`[Segment failure] req=${requestId} session=${sessionId} index=${segmentIndex}`, err);
+  } finally {
+    await cleanupUploadedFile(localFilePath);
+  }
+}
+
+async function runSegmentWorkerLoop() {
+  workerLoopScheduled = false;
+
+  while (activeSegmentWorkers < SEGMENT_WORKER_CONCURRENCY) {
+    const job = claimNextQueuedSegmentJob();
+    if (!job) break;
+
+    activeSegmentWorkers += 1;
+    processSegmentJob(job)
+      .catch((err) => {
+        console.error("[Segment worker unhandled failure]", err);
+      })
+      .finally(() => {
+        activeSegmentWorkers = Math.max(0, activeSegmentWorkers - 1);
+        scheduleSegmentWorkerLoop();
+      });
+  }
+}
+
 router.post("/sessions", (req, res) => {
   const session = createSession({
     patientName: req.body?.patientName,
@@ -196,103 +301,43 @@ router.post("/sessions/:sessionId/segments", upload.single("audio"), async (req,
     size: req.file.size,
   });
 
-  markSegmentQueued(sessionId, {
+  markSegmentReceived(sessionId);
+  setSessionStatus(sessionId, "processing_segments");
+
+  const enqueueResult = enqueueSegmentForProcessing(sessionId, {
     segmentIndex,
     requestId,
     queuedAt: new Date(receivedAtMs).toISOString(),
+    localFilePath: req.file.path,
+    mimeType: req.file.mimetype,
+    size: req.file.size,
   });
 
-  try {
-    markSegmentReceived(sessionId);
-    setSessionStatus(sessionId, "processing_segments");
-    markSegmentProcessing(sessionId, {
-      segmentIndex,
-      requestId,
-      startedAt: new Date().toISOString(),
-    });
-
-    logSegmentLifecycle({
-      phase: "transcription_started",
-      requestId,
-      sessionId,
-      segmentIndex,
-      mimeType: req.file.mimetype,
-      size: req.file.size,
-      durationMs: formatDurationMs(receivedAtMs),
-    });
-
-    const transcript = await transcribeSegment(req.file.path, req.file.mimetype);
-
-    const processingMs = formatDurationMs(receivedAtMs);
-    logSegmentLifecycle({
-      phase: "transcription_finished",
-      requestId,
-      sessionId,
-      segmentIndex,
-      durationMs: processingMs,
-      transcriptLength: transcript?.length ?? 0,
-    });
-    console.log(transcript || "[EMPTY TRANSCRIPT]");
-
-    appendTranscriptPart(sessionId, {
-      index: segmentIndex,
-      transcript,
-      receivedAt: new Date().toISOString(),
-    });
-    markSegmentTranscribed(sessionId, {
-      segmentIndex,
-      requestId,
-      completedAt: new Date().toISOString(),
-      processingMs,
-      transcript,
-    });
-
-    return res.status(202).json({
-      ok: true,
-      status: "recording",
-      segmentIndex,
-      transcriptLength: transcript?.length ?? 0,
-      processingMs,
-    });
-  } catch (err) {
-    logSegmentLifecycle({
-      phase: "failed",
-      requestId,
-      sessionId,
-      segmentIndex,
-      durationMs: formatDurationMs(receivedAtMs),
-      message: err instanceof Error ? err.message : "Unknown error",
-    });
-    console.error(`[Segment failure] req=${requestId} session=${sessionId} index=${segmentIndex}`, err);
-
-    addSessionError(sessionId, {
-      stage: "segment_transcription",
-      message: err instanceof Error ? err.message : "Unknown error",
-      segmentIndex,
-      at: new Date().toISOString(),
-    });
-    markSegmentFailed(sessionId, {
-      segmentIndex,
-      requestId,
-      completedAt: new Date().toISOString(),
-      processingMs: formatDurationMs(receivedAtMs),
-      error: {
-        stage: "segment_transcription",
-        message: err instanceof Error ? err.message : "Unknown error",
-        at: new Date().toISOString(),
-      },
-    });
-
-    return res.status(500).json({
+  if (!enqueueResult?.ok) {
+    await cleanupUploadedFile(req.file?.path);
+    const statusCode = enqueueResult?.code === "SEGMENT_ALREADY_PROCESSING" ? 409 : 422;
+    return res.status(statusCode).json({
       error: buildSegmentError({
-        stage: "segment_transcription",
+        stage: "segment_enqueue",
         segmentIndex,
-        message: err instanceof Error ? err.message : "Failed to process segment.",
+        message: enqueueResult?.message ?? "Failed to enqueue segment.",
       }),
     });
-  } finally {
-    await cleanupUploadedFile(req.file?.path);
   }
+
+  if (enqueueResult.replacedFilePath) {
+    await cleanupUploadedFile(enqueueResult.replacedFilePath);
+  }
+
+  scheduleSegmentWorkerLoop();
+
+  return res.status(202).json({
+    ok: true,
+    status: "queued",
+    segmentIndex,
+    requestId,
+    replacedExistingQueueItem: !!enqueueResult.replacedExistingQueueItem,
+  });
 });
 
 router.get("/sessions/:sessionId/status", (req, res) => {
